@@ -26,6 +26,7 @@ export async function connectToMongoDB() {
 const connectedClient = await connectToMongoDB();
 const database = connectedClient.db("fix-mate");
 const services = database.collection("services");
+const bookings = database.collection("bookings");
 
 app.get('/', (req, res) => {
     res.send('fix-mate is running')
@@ -101,7 +102,12 @@ app.delete('/services/:id', async (req, res) => {
 })
 
 
-
+// booking related aplis
+app.post('/bookings', async (req, res) => {
+    const data = req.body;
+    const result = await bookings.insertOne(data);
+    res.send(result);
+})
 
 // payments related apis
 

@@ -3,13 +3,13 @@ import cors from 'cors';
 import 'dotenv/config';
 import { MongoClient, ObjectId } from 'mongodb';
 import { createRemoteJWKSet, jwtVerify } from 'jose';
+import Stripe from 'stripe';
 
 
 const app = express();
 const port = process.env.PORT || 5000;
 
-// middleware
-app.use(express.json());
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 const corsOptions = {
     origin: ['http://localhost:3000', 'https://studio-space-ivory.vercel.app'],
@@ -34,6 +34,65 @@ const database = connectedClient.db("fix-mate");
 const services = database.collection("services");
 const bookings = database.collection("bookings");
 const users = database.collection("user");
+
+async function markBookingPaid(bookingId, session) {
+  if (!ObjectId.isValid(bookingId)) return;
+
+  await bookings.updateOne(
+    { _id: new ObjectId(bookingId) },
+    {
+      $set: {
+        paymentStatus: 'paid',
+        paidAt: new Date(),
+        stripeSessionId: session.id,
+        stripePaymentIntent:
+          typeof session.payment_intent === 'string'
+            ? session.payment_intent
+            : session.payment_intent?.id,
+        updatedAt: new Date(),
+      },
+    }
+  );
+}
+
+// Stripe needs the raw request body to verify the signature, so this route
+// must be registered before express.json().
+app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
+  const signature = req.headers['stripe-signature'];
+  const secret = process.env.STRIPE_WEBHOOK_SECRET;
+
+  if (!secret) {
+    console.error('STRIPE_WEBHOOK_SECRET is not set');
+    return res.status(500).send('Webhook secret is not configured');
+  }
+
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, signature, secret);
+  } catch (error) {
+    console.error('Stripe webhook signature verification failed:', error.message);
+    return res.status(400).send(`Webhook Error: ${error.message}`);
+  }
+
+  if (
+    event.type === 'checkout.session.completed' ||
+    event.type === 'checkout.session.async_payment_succeeded'
+  ) {
+    const session = event.data.object;
+    if (session.payment_status === 'paid' && session.metadata?.bookingId) {
+      try {
+        await markBookingPaid(session.metadata.bookingId, session);
+      } catch (error) {
+        console.error('Failed to mark booking as paid:', error);
+        return res.status(500).send('Failed to update booking');
+      }
+    }
+  }
+
+  res.send({ received: true });
+});
+
+app.use(express.json());
 
 app.get('/', (req, res) => {
     res.send('fix-mate is running')
@@ -223,6 +282,83 @@ app.get('/bookings/my/stats', verifyToken, async (req, res) => {
 });
 
 // payments related apis
+
+
+app.post('/payments/checkout', verifyToken, async (req, res) => {
+  try {
+    const { bookingId } = req.body;
+    if (!ObjectId.isValid(bookingId)) {
+      return res.status(404).send({ message: 'Booking not found' });
+    }
+
+    const booking = await bookings.findOne({
+      _id: new ObjectId(bookingId),
+      customerEmail: req.user.email,
+      status: 'completed',
+      paymentStatus: 'unpaid',
+    });
+    if (!booking) {
+      return res.status(400).send({ message: 'This booking cannot be paid right now' });
+    }
+
+    const unitAmount = Math.round(Number(booking.finalAmount) * 100);
+    if (!Number.isFinite(unitAmount) || unitAmount <= 0) {
+      return res.status(400).send({ message: 'This booking has no payable amount' });
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      customer_email: booking.customerEmail,
+      line_items: [
+        {
+          quantity: 1,
+          price_data: {
+            currency: 'usd',
+            unit_amount: unitAmount, // Stripe uses cents
+            product_data: { name: booking.serviceTitle },
+          },
+        },
+      ],
+      metadata: { bookingId: String(booking._id) },
+      success_url: `${process.env.CLIENT_URL}/dashboard/customer/bookings?payment=success&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.CLIENT_URL}/dashboard/customer/bookings?payment=cancelled`,
+    });
+
+    res.send({ url: session.url });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: 'Failed to start payment' });
+  }
+});
+
+// Fallback for local development when the Stripe webhook isn't being forwarded:
+// the client calls this when it returns from Checkout.
+app.get('/payments/verify', verifyToken, async (req, res) => {
+  try {
+    const { session_id: sessionId } = req.query;
+    if (!sessionId) {
+      return res.status(400).send({ message: 'session_id is required' });
+    }
+
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+    const bookingId = session.metadata?.bookingId;
+
+    if (bookingId && ObjectId.isValid(bookingId) && session.payment_status === 'paid') {
+      const booking = await bookings.findOne({
+        _id: new ObjectId(bookingId),
+        customerEmail: req.user.email,
+      });
+      if (booking && booking.paymentStatus !== 'paid') {
+        await markBookingPaid(bookingId, session);
+      }
+    }
+
+    res.send({ paymentStatus: session.payment_status });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: 'Failed to verify payment' });
+  }
+});
 
 
 app.listen(port, () => {

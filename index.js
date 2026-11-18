@@ -34,24 +34,95 @@ const database = connectedClient.db("fix-mate");
 const services = database.collection("services");
 const bookings = database.collection("bookings");
 const users = database.collection("user");
+const payments = database.collection("payments");
+
+const SERVICE_CATEGORIES = [
+    'Smartphone', 'Laptop', 'Air conditioner', 'Refrigerator',
+    'Television', 'Washing machine', 'Electrical',
+];
+const SERVICE_MODES = ['Home Visit', 'Shop Drop-off'];
+
+// Cleans and validates a service body. Returns { data } or { error }.
+function getServiceInput(body = {}) {
+    const data = {
+        title: String(body.title || '').trim(),
+        category: body.category,
+        description: String(body.description || '').trim(),
+        image: String(body.image || '').trim(),
+        basePrice: Number(body.basePrice),
+        estimatedDuration: String(body.estimatedDuration || '').trim(),
+        serviceMode: body.serviceMode,
+        serviceArea: String(body.serviceArea || '').trim(),
+    };
+
+    if (data.title.length < 3 || data.title.length > 100) {
+        return { error: 'Title must be 3 to 100 characters' };
+    }
+    if (!SERVICE_CATEGORIES.includes(data.category)) return { error: 'Select a valid category' };
+    if (!Number.isFinite(data.basePrice) || data.basePrice <= 0) {
+        return { error: 'Price must be a number above 0' };
+    }
+    if (!data.estimatedDuration) return { error: 'Estimated time is required' };
+    if (!SERVICE_MODES.includes(data.serviceMode)) return { error: 'Select a valid service mode' };
+    if (!data.serviceArea) return { error: 'Service area is required' };
+    if (data.description.length < 20) {
+        return { error: 'Description must be at least 20 characters' };
+    }
+    if (data.image && !/^https?:\/\/\S+$/i.test(data.image)) {
+        return { error: 'Image must be a valid link' };
+    }
+
+    return { data };
+}
 
 async function markBookingPaid(bookingId, session) {
   if (!ObjectId.isValid(bookingId)) return;
+
+  const booking = await bookings.findOne({ _id: new ObjectId(bookingId) });
+  if (!booking) return;
+
+  const paidAt = new Date();
+  const transactionId =
+    typeof session.payment_intent === 'string'
+      ? session.payment_intent
+      : session.payment_intent?.id;
 
   await bookings.updateOne(
     { _id: new ObjectId(bookingId) },
     {
       $set: {
         paymentStatus: 'paid',
-        paidAt: new Date(),
+        paidAt,
         stripeSessionId: session.id,
-        stripePaymentIntent:
-          typeof session.payment_intent === 'string'
-            ? session.payment_intent
-            : session.payment_intent?.id,
-        updatedAt: new Date(),
+        stripePaymentIntent: transactionId,
+        updatedAt: paidAt,
       },
     }
+  );
+
+  await payments.updateOne(
+    { stripeSessionId: session.id },
+    {
+      $set: {
+        bookingId: String(booking._id),
+        serviceTitle: booking.serviceTitle,
+        customerName: booking.customerName,
+        customerEmail: booking.customerEmail,
+        technicianName: booking.technicianName,
+        technicianEmail: booking.technicianEmail,
+        amount:
+          session.amount_total != null
+            ? session.amount_total / 100
+            : Number(booking.finalAmount),
+        currency: (session.currency || 'usd').toUpperCase(),
+        transactionId,
+        stripeSessionId: session.id,
+        paymentStatus: session.payment_status,
+        paidAt,
+        updatedAt: paidAt,
+      },
+    },
+    { upsert: true }
   );
 }
 
@@ -140,6 +211,11 @@ const verifyToken = async (req, res, next) => {
         return;
     }
 
+    if (!ObjectId.isValid(payload.sub)) {
+        res.status(401).send({ message: 'Unauthorized' });
+        return;
+    }
+
     const userQuery = { _id: new ObjectId(payload.sub) };
     const user = await users.findOne(userQuery);
     if (!user) {
@@ -151,6 +227,13 @@ const verifyToken = async (req, res, next) => {
     next();
 }
 
+const verifyTechnician = (req, res, next) => {
+  // req.user already comes from the database in verifyToken
+  if (req.user?.role !== 'technician') {
+    return res.status(403).send({ message: 'Only technicians can do this' });
+  }
+  next();
+};
 
 // services related apis
 function escapeRegex(str) {
@@ -162,7 +245,7 @@ app.get('/services', async (req, res) => {
     const page = Math.max(1, parseInt(req.query.page) || 1);
     const limit = Math.min(50, Math.max(1, parseInt(req.query.limit) || 8));
 
-    const query = { approvalStatus: 'approved' };
+    const query = { approvalStatus: 'approved', isAvailable: { $ne: false } };
     if (category) {
         query.category = category;
     }
@@ -198,26 +281,147 @@ app.get('/services', async (req, res) => {
     });
 })
 
-app.get(`/services/:id`, async (req, res) => {
-    const id = req.params.id;
-    const query = { _id: new ObjectId(id) };
-    const result = await services.findOne(query);
-    res.send(result);
+// Registered before /services/:id so "my" is not treated as an id
+app.get('/services/my', verifyToken, verifyTechnician, async (req, res) => {
+  try {
+    const myServices = await services
+      .find({ technicianEmail: req.user.email })
+      .sort({ createdAt: -1 })
+      .toArray();
+    res.send(myServices);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: 'Failed to fetch services' });
+  }
+});
+
+app.get('/services/my/:id', verifyToken, verifyTechnician, async (req, res) => {
+  try {
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(404).send({ message: 'Service not found' });
+    }
+    const service = await services.findOne({
+      _id: new ObjectId(req.params.id),
+      technicianEmail: req.user.email,
+    });
+    if (!service) return res.status(404).send({ message: 'Service not found' });
+    res.send(service);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: 'Failed to fetch service' });
+  }
+});
+
+app.get('/services/:id', async (req, res) => {
+    try {
+        if (!ObjectId.isValid(req.params.id)) {
+            return res.status(404).send({ message: 'Service not found' });
+        }
+        const result = await services.findOne({ _id: new ObjectId(req.params.id) });
+        if (!result) {
+            return res.status(404).send({ message: 'Service not found' });
+        }
+        res.send(result);
+    } catch (error) {
+        console.error(error);
+        res.status(500).send({ message: 'Failed to fetch service' });
+    }
+})
+
+app.put('/services/:id', verifyToken, verifyTechnician, async (req, res) => {
+  try {
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(404).send({ message: 'Service not found' });
+    }
+    const { data, error } = getServiceInput(req.body || {});
+    if (error) return res.status(400).send({ message: error });
+
+    const result = await services.updateOne(
+      { _id: new ObjectId(req.params.id), technicianEmail: req.user.email },
+      { $set: { ...data, approvalStatus: 'pending', updatedAt: new Date() } }
+    );
+    if (result.matchedCount === 0) {
+      return res.status(404).send({ message: 'Service not found' });
+    }
+    res.send({ success: true });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: 'Failed to update service' });
+  }
+});
+
+app.patch('/services/:id/availability', verifyToken, verifyTechnician, async (req, res) => {
+  try {
+    const { isAvailable } = req.body || {};
+    if (typeof isAvailable !== 'boolean') {
+      return res.status(400).send({ message: 'isAvailable must be true or false' });
+    }
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(404).send({ message: 'Service not found' });
+    }
+    const result = await services.updateOne(
+      { _id: new ObjectId(req.params.id), technicianEmail: req.user.email },
+      { $set: { isAvailable } }
+    );
+    if (result.matchedCount === 0) {
+      return res.status(404).send({ message: 'Service not found' });
+    }
+    res.send({ success: true });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: 'Failed to update availability' });
+  }
+});
+
+app.post('/services', verifyToken, async (req, res) => {
+    try {
+        // Role comes from the database, never from the client
+        if (req.user.role !== 'technician') {
+            return res.status(403).send({ message: 'Only technicians can add services' });
+        }
+
+        const { data, error } = getServiceInput(req.body || {});
+        if (error) return res.status(400).send({ message: error });
+
+        const service = {
+            ...data,
+            technicianName: req.user.name || '',
+            technicianEmail: req.user.email,
+            approvalStatus: 'pending', // an admin approves it later
+            isAvailable: true,
+            createdAt: new Date(),
+        };
+
+        const result = await services.insertOne(service);
+        res.status(201).send({ insertedId: result.insertedId });
+    } catch (error) {
+        console.error(error);
+        res.status(500).send({ message: 'Failed to add service' });
+    }
 })
 
 
-app.post('/services' , async (req, res) => {
-    const job = req.body;
-    const result = await services.insertOne(job);
-    res.send(result);
-})
+app.delete('/services/:id', verifyToken, async (req, res) => {
+    try {
+        if (!ObjectId.isValid(req.params.id)) {
+            return res.status(404).send({ message: 'Service not found' });
+        }
 
+        const query = { _id: new ObjectId(req.params.id) };
+        // Admins can delete any service; technicians only their own
+        if (req.user.role !== 'admin') {
+            query.technicianEmail = req.user.email;
+        }
 
-app.delete('/services/:id', async (req, res) => {
-    const id = req.params.id;
-    const query = { _id: new ObjectId(id) };
-    const result = await services.deleteOne(query);
-    res.send(result);
+        const result = await services.deleteOne(query);
+        if (result.deletedCount === 0) {
+            return res.status(404).send({ message: 'Service not found' });
+        }
+        res.send(result);
+    } catch (error) {
+        console.error(error);
+        res.status(500).send({ message: 'Failed to delete service' });
+    }
 })
 
 
@@ -348,12 +552,20 @@ app.get('/payments/verify', verifyToken, async (req, res) => {
         _id: new ObjectId(bookingId),
         customerEmail: req.user.email,
       });
-      if (booking && booking.paymentStatus !== 'paid') {
+      if (booking) {
         await markBookingPaid(bookingId, session);
       }
     }
 
-    res.send({ paymentStatus: session.payment_status });
+    res.send({
+      success: session.payment_status === 'paid',
+      paymentStatus: session.payment_status,
+      bookingId,
+      transactionId:
+        typeof session.payment_intent === 'string'
+          ? session.payment_intent
+          : session.payment_intent?.id,
+    });
   } catch (error) {
     console.error(error);
     res.status(500).send({ message: 'Failed to verify payment' });
@@ -361,8 +573,10 @@ app.get('/payments/verify', verifyToken, async (req, res) => {
 });
 
 
+
+
 app.listen(port, () => {
-    console.log(`hire loop is running on port ${port}`)
+    console.log(`fix-mate is fixing on port ${port}`)
 })
 
 export default app;

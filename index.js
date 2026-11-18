@@ -169,18 +169,7 @@ app.post('/bookings', async (req, res) => {
     res.send(result);
 })
 
-app.get('/bookings/my', verifyToken, async (req, res) => {
-  try {
-    const data = await bookings
-      .find({ customerEmail: req.user.email })
-      .sort({ createdAt: -1 })
-      .toArray();
-    res.send(data);
-  } catch (error) {
-    console.error(error);
-    res.status(500).send({ message: 'Failed to fetch bookings' });
-  }
-});
+
 
 
 // Overview stats

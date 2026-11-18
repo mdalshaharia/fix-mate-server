@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import 'dotenv/config';
 import { MongoClient, ObjectId } from 'mongodb';
+import { createRemoteJWKSet, jwtVerify } from 'jose';
 
 
 const app = express();
@@ -9,7 +10,12 @@ const port = process.env.PORT || 5000;
 
 // middleware
 app.use(express.json());
-app.use(cors());
+
+const corsOptions = {
+    origin: ['http://localhost:3000', 'https://studio-space-ivory.vercel.app'],
+    credentials: true,
+};
+app.use(cors(corsOptions));
 
 const client = new MongoClient(`${process.env.DB_URL}`);
 
@@ -27,10 +33,64 @@ const connectedClient = await connectToMongoDB();
 const database = connectedClient.db("fix-mate");
 const services = database.collection("services");
 const bookings = database.collection("bookings");
+const users = database.collection("user");
 
 app.get('/', (req, res) => {
     res.send('fix-mate is running')
 })
+
+// auth related api
+app.post('/auth/login', async (req, res) => {
+    const { token } = req.body;
+    if (!token) {
+        return res.status(400).send({ message: 'Token is required' });
+    }
+    res.cookie('token', token, {
+        httpOnly: true,
+        sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
+        secure: process.env.NODE_ENV === 'production',
+        maxAge: 7 * 24 * 60 * 60 * 1000,
+    });
+    res.send({ ok: true });
+})
+
+
+const JWKS = createRemoteJWKSet(
+    new URL(`${process.env.CLIENT_URL || 'http://localhost:3000'}/api/auth/jwks`)
+);
+
+const verifyToken = async (req, res, next) => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) {
+        res.status(401).send({ message: 'Unauthorized' });
+        return;
+    }
+    const token = authHeader.split(' ')[1];
+    if (!token) {
+        res.status(401).send({ message: 'Unauthorized' });
+        return;
+    }
+
+    let payload;
+    try {
+        const result = await jwtVerify(token, JWKS);
+        payload = result.payload;
+    } catch (err) {
+        console.error('JWT verification failed:', err.code || err.message);
+        res.status(401).send({ message: 'Unauthorized' });
+        return;
+    }
+
+    const userQuery = { _id: new ObjectId(payload.sub) };
+    const user = await users.findOne(userQuery);
+    if (!user) {
+        res.status(401).send({ message: 'Unauthorized' });
+        return;
+    }
+
+    req.user = user;
+    next();
+}
 
 
 // services related apis
@@ -108,6 +168,38 @@ app.post('/bookings', async (req, res) => {
     const result = await bookings.insertOne(data);
     res.send(result);
 })
+
+app.get('/bookings/my', verifyToken, async (req, res) => {
+  try {
+    const data = await bookings
+      .find({ customerEmail: req.user.email })
+      .sort({ createdAt: -1 })
+      .toArray();
+    res.send(data);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: 'Failed to fetch bookings' });
+  }
+});
+
+
+// Overview stats
+app.get('/bookings/my/stats', verifyToken, async (req, res) => {
+  try {
+    const customerEmail = req.user.email;
+    // console.log(customerEmail)
+    const [totalRequests, activeJobs, completedJobs] = await Promise.all([
+      bookings.countDocuments({ customerEmail }),
+      bookings.countDocuments({ customerEmail, status: { $in: ['accepted', 'in-progress'] } }),
+      bookings.countDocuments({ customerEmail, status: 'completed' }),
+    ]);
+    console.log(totalRequests)
+    res.send({ totalRequests, activeJobs, completedJobs });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: 'Failed to fetch stats' });
+  }
+});
 
 // payments related apis
 

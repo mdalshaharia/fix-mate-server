@@ -183,6 +183,26 @@ app.get('/bookings/my', verifyToken, async (req, res) => {
   }
 });
 
+app.patch('/bookings/:id/cancel', verifyToken, async (req, res) => {
+  try {
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(404).send({ message: 'Booking not found' });
+    }
+    const result = await bookings.updateOne(
+      { _id: new ObjectId(req.params.id), customerEmail: req.user.email, status: 'requested' },
+      { $set: { status: 'cancelled', updatedAt: new Date() } }
+    );
+    if (result.matchedCount === 0) {
+      return res.status(409).send({ message: 'This booking can no longer be cancelled' });
+    }
+    res.send({ success: true });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: 'Failed to cancel booking' });
+  }
+});
+
+
 
 // Overview stats
 app.get('/bookings/my/stats', verifyToken, async (req, res) => {

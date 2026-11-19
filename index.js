@@ -425,11 +425,73 @@ app.delete('/services/:id', verifyToken, async (req, res) => {
 })
 
 
-// booking related aplis
-app.post('/bookings', async (req, res) => {
-    const data = req.body;
-    const result = await bookings.insertOne(data);
-    res.send(result);
+// booking related apis
+const ACTIVE_BOOKING_STATUSES = ['requested', 'accepted', 'in-progress'];
+
+app.post('/bookings', verifyToken, async (req, res) => {
+  try {
+    if (req.user.role !== 'customer') {
+      return res.status(403).send({ message: 'Only customers can send a repair request' });
+    }
+
+    const body = req.body || {};
+    const serviceId = String(body.serviceId || '').trim();
+    const serviceTitle = String(body.serviceTitle || '').trim();
+    const technicianEmail = String(body.technicianEmail || '').trim().toLowerCase();
+    const customerPhone = String(body.customerPhone || '').trim();
+    const address = String(body.address || '').trim();
+    const preferredDate = String(body.preferredDate || '').trim();
+    const problemDescription = String(body.problemDescription || '').trim();
+
+    if (!serviceId || !serviceTitle || !technicianEmail || !customerPhone || !address || !preferredDate || !problemDescription) {
+      return res.status(400).send({ message: 'Missing required booking fields' });
+    }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(preferredDate) || Number.isNaN(Date.parse(preferredDate))) {
+      return res.status(400).send({ message: 'Invalid preferred date' });
+    }
+    if (problemDescription.length < 10) {
+      return res.status(400).send({ message: 'Please describe the problem in more detail' });
+    }
+
+    const customerEmail = req.user.email;
+    const duplicate = await bookings.findOne({
+      serviceId,
+      customerEmail,
+      status: { $in: ACTIVE_BOOKING_STATUSES },
+    });
+    if (duplicate) {
+      return res.status(409).send({ message: 'You already have an active request for this service' });
+    }
+
+    const basePrice = Number(body.basePrice);
+    const now = new Date();
+    const doc = {
+      serviceId,
+      serviceTitle,
+      serviceImage: String(body.serviceImage || ''),
+      category: String(body.category || ''),
+      basePrice: Number.isFinite(basePrice) ? basePrice : null,
+      finalAmount: Number.isFinite(basePrice) ? basePrice : null,
+      technicianName: String(body.technicianName || ''),
+      technicianEmail,
+      customerName: req.user.name || '',
+      customerEmail,
+      customerPhone,
+      address,
+      preferredDate,
+      problemDescription,
+      status: 'requested',
+      paymentStatus: 'unpaid',
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    const result = await bookings.insertOne(doc);
+    res.status(201).send({ ...doc, _id: result.insertedId });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: 'Failed to create booking' });
+  }
 })
 
 
@@ -471,13 +533,11 @@ app.patch('/bookings/:id/cancel', verifyToken, async (req, res) => {
 app.get('/bookings/my/stats', verifyToken, async (req, res) => {
   try {
     const customerEmail = req.user.email;
-    // console.log(customerEmail)
     const [totalRequests, activeJobs, completedJobs] = await Promise.all([
       bookings.countDocuments({ customerEmail }),
       bookings.countDocuments({ customerEmail, status: { $in: ['accepted', 'in-progress'] } }),
       bookings.countDocuments({ customerEmail, status: 'completed' }),
     ]);
-    console.log(totalRequests)
     res.send({ totalRequests, activeJobs, completedJobs });
   } catch (error) {
     console.error(error);
@@ -572,6 +632,88 @@ app.get('/payments/verify', verifyToken, async (req, res) => {
   }
 });
 
+// technician related api
+
+const FILTER_STATUSES = ['requested', 'accepted', 'in-progress', 'completed', 'rejected', 'cancelled'];
+
+// key = new status, value = the status the booking must have right now
+const STATUS_FLOW = {
+  accepted: 'requested',
+  rejected: 'requested',
+  'in-progress': 'accepted',
+  completed: 'in-progress',
+};
+
+app.get('/bookings/technician/stats', verifyToken, verifyTechnician, async (req, res) => {
+  try {
+    const technicianEmail = req.user.email;
+    const [totalRequests, activeJobs, completedJobs] = await Promise.all([
+      bookings.countDocuments({ technicianEmail }),
+      bookings.countDocuments({ technicianEmail, status: { $in: ['accepted', 'in-progress'] } }),
+      bookings.countDocuments({ technicianEmail, status: 'completed' }),
+    ]);
+    res.send({ totalRequests, activeJobs, completedJobs });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: 'Failed to fetch stats' });
+  }
+});
+
+app.get('/bookings/technician', verifyToken, verifyTechnician, async (req, res) => {
+  try {
+    const query = { technicianEmail: req.user.email };
+    if (FILTER_STATUSES.includes(req.query.status)) {
+      query.status = req.query.status;
+    }
+
+    const docs = await bookings.find(query).sort({ createdAt: -1 }).toArray();
+    res.send(docs);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: 'Failed to fetch requests' });
+  }
+});
+
+app.patch('/bookings/:id/status', verifyToken, verifyTechnician, async (req, res) => {
+  try {
+    const { status, finalAmount } = req.body || {};
+
+    if (typeof status !== 'string' || !Object.hasOwn(STATUS_FLOW, status)) {
+      return res.status(400).send({ message: 'Invalid status' });
+    }
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(404).send({ message: 'Request not found' });
+    }
+
+    const update = { status, updatedAt: new Date() };
+
+    if (status === 'completed') {
+      const amount = Number(finalAmount);
+      if (!Number.isFinite(amount) || amount <= 0) {
+        return res.status(400).send({ message: 'Final amount must be a number above 0' });
+      }
+      update.finalAmount = Math.round(amount * 100) / 100;
+    }
+
+    // One atomic update: owner AND current status are checked together
+    const result = await bookings.updateOne(
+      {
+        _id: new ObjectId(req.params.id),
+        technicianEmail: req.user.email,
+        status: STATUS_FLOW[status],
+      },
+      { $set: update }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(409).send({ message: 'This request can no longer be updated' });
+    }
+    res.send({ success: true });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: 'Failed to update request' });
+  }
+});
 
 
 

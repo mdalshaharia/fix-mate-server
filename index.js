@@ -222,6 +222,10 @@ const verifyToken = async (req, res, next) => {
         res.status(401).send({ message: 'Unauthorized' });
         return;
     }
+    if (user.banned) {
+        res.status(403).send({ message: 'Your account has been suspended' });
+        return;
+    }
 
     req.user = user;
     next();
@@ -233,6 +237,19 @@ const verifyTechnician = (req, res, next) => {
     return res.status(403).send({ message: 'Only technicians can do this' });
   }
   next();
+};
+
+const verifyAdmin = async (req, res, next) => {
+  try {
+    // req.user already comes from the database in verifyToken (and ban-checked there)
+    if (req.user?.role !== 'admin') {
+      return res.status(403).send({ message: 'Admins only' });
+    }
+    next();
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: 'Something went wrong' });
+  }
 };
 
 // services related apis
@@ -712,6 +729,113 @@ app.patch('/bookings/:id/status', verifyToken, verifyTechnician, async (req, res
   } catch (error) {
     console.error(error);
     res.status(500).send({ message: 'Failed to update request' });
+  }
+});
+
+// admin related apis
+app.get('/admin/stats', verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const [totalUsers, totalTechnicians, pendingServices] = await Promise.all([
+      users.countDocuments(),
+      users.countDocuments({ role: 'technician' }),
+      services.countDocuments({ approvalStatus: 'pending' }),
+    ]);
+    res.send({ totalUsers, totalTechnicians, pendingServices });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: 'Failed to fetch stats' });
+  }
+});
+
+const USER_ROLES = ['customer', 'technician', 'admin'];
+
+// List users (paginated, newest first). Only safe fields are returned.
+app.get('/admin/users', verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const pageNumber = Math.max(parseInt(req.query.page) || 1, 1);
+    const limitNumber = Math.min(Math.max(parseInt(req.query.limit) || 10, 1), 50);
+
+    const [docs, total] = await Promise.all([
+      users
+        .find({}, { projection: { name: 1, email: 1, image: 1, role: 1, banned: 1, createdAt: 1 } })
+        .sort({ createdAt: -1, _id: 1 }) // _id keeps pagination order stable
+        .skip((pageNumber - 1) * limitNumber)
+        .limit(limitNumber)
+        .toArray(),
+      users.countDocuments(),
+    ]);
+
+    res.send({ users: docs, total, page: pageNumber, totalPages: Math.ceil(total / limitNumber) });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: 'Failed to fetch users' });
+  }
+});
+
+// Change a user's role
+app.patch('/admin/users/:id/role', verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const { role } = req.body || {};
+
+    if (!USER_ROLES.includes(role)) {
+      return res.status(400).send({ message: 'Invalid role' });
+    }
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(404).send({ message: 'User not found' });
+    }
+
+    const target = await users.findOne(
+      { _id: new ObjectId(req.params.id) },
+      { projection: { email: 1 } }
+    );
+    if (!target) return res.status(404).send({ message: 'User not found' });
+
+    // Checked on the server, so it can't be bypassed from the browser
+    if (target.email === req.user.email) {
+      return res.status(403).send({ message: 'You cannot change your own role' });
+    }
+
+    await users.updateOne({ _id: target._id }, { $set: { role, updatedAt: new Date() } });
+    res.send({ success: true });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: 'Failed to update role' });
+  }
+});
+
+// Ban / unban a user
+app.patch('/admin/users/:id/ban', verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const { banned, reason } = req.body || {};
+
+    if (typeof banned !== 'boolean') {
+      return res.status(400).send({ message: 'banned must be true or false' });
+    }
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(404).send({ message: 'User not found' });
+    }
+
+    const target = await users.findOne(
+      { _id: new ObjectId(req.params.id) },
+      { projection: { email: 1 } }
+    );
+    if (!target) return res.status(404).send({ message: 'User not found' });
+
+    if (target.email === req.user.email) {
+      return res.status(403).send({ message: 'You cannot ban yourself' });
+    }
+
+    const update = {
+      banned,
+      bannedAt: banned ? new Date() : null,
+      bannedReason: banned ? String(reason || '').slice(0, 500) : null,
+      updatedAt: new Date(),
+    };
+    await users.updateOne({ _id: target._id }, { $set: update });
+    res.send({ success: true, banned });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: 'Failed to update ban status' });
   }
 });
 

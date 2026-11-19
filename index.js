@@ -36,6 +36,15 @@ const bookings = database.collection("bookings");
 const users = database.collection("user");
 const payments = database.collection("payments");
 
+// One payment per Stripe session, even if Stripe sends the webhook twice.
+// Index failures (e.g. legacy duplicate docs) log a warning but must not block startup.
+try {
+    await payments.createIndex({ stripeSessionId: 1 }, { unique: true });
+    await payments.createIndex({ paidAt: -1 });
+} catch (err) {
+    console.warn('payments index creation failed:', err.message);
+}
+
 const SERVICE_CATEGORIES = [
     'Smartphone', 'Laptop', 'Air conditioner', 'Refrigerator',
     'Television', 'Washing machine', 'Electrical',
@@ -81,14 +90,20 @@ async function markBookingPaid(bookingId, session) {
   const booking = await bookings.findOne({ _id: new ObjectId(bookingId) });
   if (!booking) return;
 
+  // Already paid through a different checkout session — ignore this one
+  if (booking.paymentStatus === 'paid' && booking.stripeSessionId !== session.id) {
+    return;
+  }
+
   const paidAt = new Date();
   const transactionId =
     typeof session.payment_intent === 'string'
       ? session.payment_intent
       : session.payment_intent?.id;
 
-  await bookings.updateOne(
-    { _id: new ObjectId(bookingId) },
+  // Only unpaid → paid transitions; webhook retries / verify calls become no-ops
+  const result = await bookings.updateOne(
+    { _id: new ObjectId(bookingId), paymentStatus: { $ne: 'paid' } },
     {
       $set: {
         paymentStatus: 'paid',
@@ -99,6 +114,11 @@ async function markBookingPaid(bookingId, session) {
       },
     }
   );
+
+  if (result.matchedCount === 0) {
+    const current = await bookings.findOne({ _id: new ObjectId(bookingId) });
+    if (!current || current.stripeSessionId !== session.id) return;
+  }
 
   await payments.updateOne(
     { stripeSessionId: session.id },
@@ -751,12 +771,14 @@ app.patch('/bookings/:id/status', verifyToken, verifyTechnician, async (req, res
 // admin related apis
 app.get('/admin/stats', verifyToken, verifyAdmin, async (req, res) => {
   try {
-    const [totalUsers, totalTechnicians, pendingServices] = await Promise.all([
+    const [totalUsers, totalTechnicians, pendingServices, revenueSummary] = await Promise.all([
       users.countDocuments(),
       users.countDocuments({ role: 'technician' }),
       services.countDocuments({ approvalStatus: 'pending' }),
+      payments.aggregate([{ $group: { _id: null, revenue: { $sum: '$amount' } } }]).toArray(),
     ]);
-    res.send({ totalUsers, totalTechnicians, pendingServices });
+    const totalRevenue = Math.round((revenueSummary[0]?.revenue || 0) * 100) / 100;
+    res.send({ totalUsers, totalTechnicians, pendingServices, totalRevenue });
   } catch (error) {
     console.error(error);
     res.status(500).send({ message: 'Failed to fetch stats' });
@@ -913,6 +935,74 @@ app.patch('/admin/services/:id/approval', verifyToken, verifyAdmin, async (req, 
   } catch (error) {
     console.error(error);
     res.status(500).send({ message: 'Failed to update service' });
+  }
+});
+
+const BOOKING_STATUSES = ['requested', 'accepted', 'in-progress', 'completed', 'rejected', 'cancelled'];
+
+// Every booking on the platform (read-only), optionally filtered by status
+app.get('/admin/bookings', verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const query = {};
+    if (BOOKING_STATUSES.includes(req.query.status)) {
+      query.status = req.query.status;
+    }
+
+    const pageNumber = Math.max(parseInt(req.query.page) || 1, 1);
+    const limitNumber = Math.min(Math.max(parseInt(req.query.limit) || 10, 1), 50);
+
+    const [docs, total] = await Promise.all([
+      bookings
+        .find(query)
+        .sort({ createdAt: -1, _id: 1 }) // _id keeps pagination stable
+        .skip((pageNumber - 1) * limitNumber)
+        .limit(limitNumber)
+        .toArray(),
+      bookings.countDocuments(query),
+    ]);
+
+    res.send({ bookings: docs, total, page: pageNumber, totalPages: Math.ceil(total / limitNumber) });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: 'Failed to fetch bookings' });
+  }
+});
+
+
+// Every payment (newest first) plus totals for the whole collection
+app.get('/admin/payments', verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const pageNumber = Math.max(parseInt(req.query.page) || 1, 1);
+    const limitNumber = Math.min(Math.max(parseInt(req.query.limit) || 10, 1), 50);
+
+    const [docs, total, summary] = await Promise.all([
+      payments
+        .find()
+        .sort({ paidAt: -1, _id: 1 }) // _id keeps pagination order stable
+        .skip((pageNumber - 1) * limitNumber)
+        .limit(limitNumber)
+        .toArray(),
+      payments.countDocuments(),
+      payments.aggregate([{ $group: { _id: null, revenue: { $sum: '$amount' } } }]).toArray(),
+    ]);
+
+    const round = (n) => Math.round(n * 100) / 100;
+    const totalRevenue = round(summary[0]?.revenue || 0);
+
+    res.send({
+      payments: docs,
+      total,
+      page: pageNumber,
+      totalPages: Math.ceil(total / limitNumber),
+      stats: {
+        totalRevenue,
+        transactions: total,
+        averageJob: total ? round(totalRevenue / total) : 0,
+      },
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: 'Failed to fetch payments' });
   }
 });
 

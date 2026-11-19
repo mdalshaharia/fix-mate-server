@@ -334,7 +334,12 @@ app.get('/services/:id', async (req, res) => {
         if (!ObjectId.isValid(req.params.id)) {
             return res.status(404).send({ message: 'Service not found' });
         }
-        const result = await services.findOne({ _id: new ObjectId(req.params.id) });
+        // Public detail: only approved + available services (matches the list endpoint)
+        const result = await services.findOne({
+            _id: new ObjectId(req.params.id),
+            approvalStatus: 'approved',
+            isAvailable: { $ne: false },
+        });
         if (!result) {
             return res.status(404).send({ message: 'Service not found' });
         }
@@ -453,21 +458,32 @@ app.post('/bookings', verifyToken, async (req, res) => {
 
     const body = req.body || {};
     const serviceId = String(body.serviceId || '').trim();
-    const serviceTitle = String(body.serviceTitle || '').trim();
-    const technicianEmail = String(body.technicianEmail || '').trim().toLowerCase();
     const customerPhone = String(body.customerPhone || '').trim();
     const address = String(body.address || '').trim();
     const preferredDate = String(body.preferredDate || '').trim();
     const problemDescription = String(body.problemDescription || '').trim();
 
-    if (!serviceId || !serviceTitle || !technicianEmail || !customerPhone || !address || !preferredDate || !problemDescription) {
+    if (!serviceId || !customerPhone || !address || !preferredDate || !problemDescription) {
       return res.status(400).send({ message: 'Missing required booking fields' });
+    }
+    if (!ObjectId.isValid(serviceId)) {
+      return res.status(404).send({ message: 'Service not found' });
     }
     if (!/^\d{4}-\d{2}-\d{2}$/.test(preferredDate) || Number.isNaN(Date.parse(preferredDate))) {
       return res.status(400).send({ message: 'Invalid preferred date' });
     }
     if (problemDescription.length < 10) {
       return res.status(400).send({ message: 'Please describe the problem in more detail' });
+    }
+
+    // Trust the database, not the client: the service must exist, be approved and bookable
+    const service = await services.findOne({
+      _id: new ObjectId(serviceId),
+      approvalStatus: 'approved',
+      isAvailable: { $ne: false },
+    });
+    if (!service) {
+      return res.status(404).send({ message: 'Service not found or not available for booking' });
     }
 
     const customerEmail = req.user.email;
@@ -480,17 +496,17 @@ app.post('/bookings', verifyToken, async (req, res) => {
       return res.status(409).send({ message: 'You already have an active request for this service' });
     }
 
-    const basePrice = Number(body.basePrice);
+    const basePrice = Number(service.basePrice);
     const now = new Date();
     const doc = {
       serviceId,
-      serviceTitle,
-      serviceImage: String(body.serviceImage || ''),
-      category: String(body.category || ''),
+      serviceTitle: String(service.title || ''),
+      serviceImage: String(service.image || ''),
+      category: String(service.category || ''),
       basePrice: Number.isFinite(basePrice) ? basePrice : null,
       finalAmount: Number.isFinite(basePrice) ? basePrice : null,
-      technicianName: String(body.technicianName || ''),
-      technicianEmail,
+      technicianName: String(service.technicianName || ''),
+      technicianEmail: String(service.technicianEmail || ''),
       customerName: req.user.name || '',
       customerEmail,
       customerPhone,
@@ -836,6 +852,67 @@ app.patch('/admin/users/:id/ban', verifyToken, verifyAdmin, async (req, res) => 
   } catch (error) {
     console.error(error);
     res.status(500).send({ message: 'Failed to update ban status' });
+  }
+});
+
+const APPROVAL_FILTERS = ['pending', 'approved', 'rejected'];
+
+// All services from all technicians, optionally filtered by approval status
+app.get('/admin/services', verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const query = {};
+    if (APPROVAL_FILTERS.includes(req.query.status)) {
+      query.approvalStatus = req.query.status;
+    }
+
+    const pageNumber = Math.max(parseInt(req.query.page) || 1, 1);
+    const limitNumber = Math.min(Math.max(parseInt(req.query.limit) || 10, 1), 50);
+
+    const [docs, total] = await Promise.all([
+      services
+        .aggregate([
+          { $match: query },
+          // Pending services come first when the filter is "All"
+          { $addFields: { pendingFirst: { $cond: [{ $eq: ['$approvalStatus', 'pending'] }, 0, 1] } } },
+          { $sort: { pendingFirst: 1, createdAt: -1, _id: 1 } }, // _id keeps pagination stable
+          { $skip: (pageNumber - 1) * limitNumber },
+          { $limit: limitNumber },
+          { $project: { pendingFirst: 0 } },
+        ])
+        .toArray(),
+      services.countDocuments(query),
+    ]);
+
+    res.send({ services: docs, total, page: pageNumber, totalPages: Math.ceil(total / limitNumber) });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: 'Failed to fetch services' });
+  }
+});
+
+// Approve or reject a service
+app.patch('/admin/services/:id/approval', verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const { approvalStatus } = req.body || {};
+
+    if (!['approved', 'rejected'].includes(approvalStatus)) {
+      return res.status(400).send({ message: 'Invalid approval status' });
+    }
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(404).send({ message: 'Service not found' });
+    }
+
+    const result = await services.updateOne(
+      { _id: new ObjectId(req.params.id) },
+      { $set: { approvalStatus, reviewedAt: new Date(), reviewedBy: req.user.email } }
+    );
+    if (result.matchedCount === 0) {
+      return res.status(404).send({ message: 'Service not found' });
+    }
+    res.send({ success: true });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: 'Failed to update service' });
   }
 });
 

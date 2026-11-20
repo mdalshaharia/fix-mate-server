@@ -318,6 +318,22 @@ app.get('/services', async (req, res) => {
     });
 })
 
+// Home page "Featured services": the 6 newest approved + available services.
+// Registered before /services/:id so "featured" is not treated as an id.
+app.get('/services/featured', async (req, res) => {
+    try {
+        const result = await services
+            .find({ approvalStatus: 'approved', isAvailable: true })
+            .sort({ createdAt: -1 })
+            .limit(6)
+            .toArray();
+        res.send(result);
+    } catch (error) {
+        console.error(error);
+        res.status(500).send({ message: 'Failed to fetch featured services' });
+    }
+});
+
 // Registered before /services/:id so "my" is not treated as an id
 app.get('/services/my', verifyToken, verifyTechnician, async (req, res) => {
   try {

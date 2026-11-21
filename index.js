@@ -259,6 +259,14 @@ const verifyTechnician = (req, res, next) => {
   next();
 };
 
+// Customer-only guard (req.user comes from the database in verifyToken)
+const verifyCustomer = (req, res, next) => {
+  if (req.user?.role !== 'customer') {
+    return res.status(403).send({ message: 'Only customers can do this' });
+  }
+  next();
+};
+
 const verifyAdmin = async (req, res, next) => {
   try {
     // req.user already comes from the database in verifyToken (and ban-checked there)
@@ -379,7 +387,28 @@ app.get('/services/:id', async (req, res) => {
         if (!result) {
             return res.status(404).send({ message: 'Service not found' });
         }
-        res.send(result);
+
+        // Attach the technician's public profile so the details page can show
+        // their avatar, bio and area (services only store name + email).
+        const technician = result.technicianEmail
+            ? await users.findOne(
+                { email: result.technicianEmail },
+                { projection: { name: 1, email: 1, image: 1, bio: 1, area: 1, _id: 0 } }
+            )
+            : null;
+
+        res.send({
+            ...result,
+            technician: technician
+                ? {
+                    name: technician.name || result.technicianName || '',
+                    email: technician.email || result.technicianEmail || '',
+                    image: technician.image || '',
+                    bio: technician.bio || '',
+                    area: technician.area || '',
+                }
+                : null,
+        });
     } catch (error) {
         console.error(error);
         res.status(500).send({ message: 'Failed to fetch service' });
@@ -617,9 +646,9 @@ app.get('/bookings/my/stats', verifyToken, async (req, res) => {
 // payments related apis
 
 
-app.post('/payments/checkout', verifyToken, async (req, res) => {
+app.post('/payments/checkout', verifyToken, verifyCustomer, async (req, res) => {
   try {
-    const { bookingId } = req.body;
+    const { bookingId } = req.body || {};
     if (!ObjectId.isValid(bookingId)) {
       return res.status(404).send({ message: 'Booking not found' });
     }
@@ -639,6 +668,12 @@ app.post('/payments/checkout', verifyToken, async (req, res) => {
       return res.status(400).send({ message: 'This booking has no payable amount' });
     }
 
+    // Send the customer back to the page that started the checkout
+    const returnPath =
+      req.body?.returnTo === 'payments'
+        ? '/dashboard/customer/payments'
+        : '/dashboard/customer/bookings';
+
     const session = await stripe.checkout.sessions.create({
       mode: 'payment',
       customer_email: booking.customerEmail,
@@ -653,8 +688,8 @@ app.post('/payments/checkout', verifyToken, async (req, res) => {
         },
       ],
       metadata: { bookingId: String(booking._id) },
-      success_url: `${process.env.CLIENT_URL}/dashboard/customer/bookings?payment=success&session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${process.env.CLIENT_URL}/dashboard/customer/bookings?payment=cancelled`,
+      success_url: `${process.env.CLIENT_URL}${returnPath}?payment=success&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.CLIENT_URL}${returnPath}?payment=cancelled`,
     });
 
     res.send({ url: session.url });
@@ -666,7 +701,7 @@ app.post('/payments/checkout', verifyToken, async (req, res) => {
 
 // Fallback for local development when the Stripe webhook isn't being forwarded:
 // the client calls this when it returns from Checkout.
-app.get('/payments/verify', verifyToken, async (req, res) => {
+app.get('/payments/verify', verifyToken, verifyCustomer, async (req, res) => {
   try {
     const { session_id: sessionId } = req.query;
     if (!sessionId) {
@@ -1022,6 +1057,55 @@ app.get('/admin/payments', verifyToken, verifyAdmin, async (req, res) => {
   }
 });
 
+// Payment overview of the logged-in customer
+app.get('/payments/my', verifyToken,verifyCustomer , async (req, res) => {
+  try {
+    const customerEmail = req.user.email;
+    const pageNumber = Math.max(parseInt(req.query.page) || 1, 1);
+    const limitNumber = Math.min(Math.max(parseInt(req.query.limit) || 10, 1), 50);
+
+    const [paymentDocs, total, paidSummary, dueBookings] = await Promise.all([
+      payments
+        .find({ customerEmail })
+        .sort({ paidAt: -1, _id: 1 }) // _id keeps pagination order stable
+        .skip((pageNumber - 1) * limitNumber)
+        .limit(limitNumber)
+        .toArray(),
+      payments.countDocuments({ customerEmail }),
+      payments
+        .aggregate([
+          { $match: { customerEmail } },
+          { $group: { _id: null, totalPaid: { $sum: '$amount' } } },
+        ])
+        .toArray(),
+      // Completed jobs the customer still has to pay for
+      bookings
+        .find({ customerEmail, status: 'completed', paymentStatus: 'unpaid' })
+        .sort({ updatedAt: -1 })
+        .toArray(),
+    ]);
+
+    const round = (n) => Math.round(n * 100) / 100;
+
+    res.send({
+      payments: paymentDocs,
+      total,
+      page: pageNumber,
+      totalPages: Math.ceil(total / limitNumber),
+      dueBookings,
+      stats: {
+        totalPaid: round(paidSummary[0]?.totalPaid || 0),
+        paymentsCount: total,
+        amountDue: round(
+          dueBookings.reduce((sum, b) => sum + (Number(b.finalAmount) || 0), 0)
+        ),
+      },
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: 'Failed to fetch payments' });
+  }
+});
 
 
 app.listen(port, () => {

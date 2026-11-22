@@ -108,8 +108,6 @@ const bookings = database.collection("bookings");
 const users = database.collection("user");
 const payments = database.collection("payments");
 
-// One payment per Stripe session, even if Stripe sends the webhook twice.
-// Index failures (e.g. legacy duplicate docs) log a warning but must not block startup.
 try {
     await payments.createIndex({ stripeSessionId: 1 }, { unique: true });
     await payments.createIndex({ paidAt: -1 });
@@ -764,8 +762,6 @@ app.post('/payments/checkout', verifyToken, verifyCustomer, async (req, res) => 
       return res.status(400).send({ message: 'This booking has no payable amount' });
     }
 
-    // Stripe reuses the same session for an identical idempotency key, so a
-    // double-click or retry cannot charge the same booking twice.
     const idempotencyKey = `checkout_${booking._id}_${
       booking.updatedAt instanceof Date ? booking.updatedAt.getTime() : 'na'
     }`;
@@ -778,7 +774,7 @@ app.post('/payments/checkout', verifyToken, verifyCustomer, async (req, res) => 
           quantity: 1,
           price_data: {
             currency: 'usd',
-            unit_amount: unitAmount, // Stripe uses cents
+            unit_amount: unitAmount,
             product_data: { name: booking.serviceTitle },
           },
         },
@@ -795,8 +791,6 @@ app.post('/payments/checkout', verifyToken, verifyCustomer, async (req, res) => 
   }
 });
 
-// Fallback for local development when the Stripe webhook isn't being forwarded:
-// the client calls this when it returns from Checkout.
 app.get('/payments/verify', verifyToken, verifyCustomer, async (req, res) => {
   try {
     const { session_id: sessionId } = req.query;
@@ -849,7 +843,6 @@ app.get('/payments/verify', verifyToken, verifyCustomer, async (req, res) => {
 
 const FILTER_STATUSES = ['requested', 'accepted', 'in-progress', 'completed', 'rejected', 'cancelled'];
 
-// key = new status, value = the status the booking must have right now
 const STATUS_FLOW = {
   accepted: 'requested',
   rejected: 'requested',
@@ -918,7 +911,7 @@ app.patch('/bookings/:id/status', verifyToken, verifyTechnician, async (req, res
       update.finalAmount = Math.round(amount * 100) / 100;
     }
 
-    // One atomic update: owner AND current status are checked together
+
     const result = await bookings.updateOne(
       {
         _id: new ObjectId(req.params.id),
@@ -957,7 +950,6 @@ app.get('/admin/stats', verifyToken, verifyAdmin, async (req, res) => {
 
 const USER_ROLES = ['customer', 'technician', 'admin'];
 
-// List users (paginated, newest first). Only safe fields are returned.
 app.get('/admin/users', verifyToken, verifyAdmin, async (req, res) => {
   try {
     const pageNumber = Math.max(parseInt(req.query.page) || 1, 1);
@@ -997,8 +989,6 @@ app.patch('/admin/users/:id/role', verifyToken, verifyAdmin, async (req, res) =>
       { projection: { email: 1 } }
     );
     if (!target) return res.status(404).send({ message: 'User not found' });
-
-    // Checked on the server, so it can't be bypassed from the browser
     if (target.email === req.user.email) {
       return res.status(403).send({ message: 'You cannot change your own role' });
     }
@@ -1064,7 +1054,6 @@ app.get('/admin/services', verifyToken, verifyAdmin, async (req, res) => {
       services
         .aggregate([
           { $match: query },
-          // Pending services come first when the filter is "All"
           { $addFields: { pendingFirst: { $cond: [{ $eq: ['$approvalStatus', 'pending'] }, 0, 1] } } },
           { $sort: { pendingFirst: 1, createdAt: -1, _id: 1 } }, // _id keeps pagination stable
           { $skip: (pageNumber - 1) * limitNumber },
@@ -1124,7 +1113,7 @@ app.get('/admin/bookings', verifyToken, verifyAdmin, async (req, res) => {
     const [docs, total] = await Promise.all([
       bookings
         .find(query)
-        .sort({ createdAt: -1, _id: 1 }) // _id keeps pagination stable
+        .sort({ createdAt: -1, _id: 1 })
         .skip((pageNumber - 1) * limitNumber)
         .limit(limitNumber)
         .toArray(),
@@ -1139,7 +1128,6 @@ app.get('/admin/bookings', verifyToken, verifyAdmin, async (req, res) => {
 });
 
 
-// Every payment (newest first) plus totals for the whole collection
 app.get('/admin/payments', verifyToken, verifyAdmin, async (req, res) => {
   try {
     const pageNumber = Math.max(parseInt(req.query.page) || 1, 1);
@@ -1197,7 +1185,6 @@ app.get('/payments/my', verifyToken,verifyCustomer , async (req, res) => {
           { $group: { _id: null, totalPaid: { $sum: '$amount' } } },
         ])
         .toArray(),
-      // Completed jobs the customer still has to pay for
       bookings
         .find({ customerEmail, status: 'completed', paymentStatus: 'unpaid' })
         .sort({ updatedAt: -1 })

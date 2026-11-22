@@ -1,23 +1,94 @@
 import express from 'express';
 import cors from 'cors';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
 import 'dotenv/config';
 import { MongoClient, ObjectId } from 'mongodb';
 import { createRemoteJWKSet, jwtVerify } from 'jose';
 import Stripe from 'stripe';
 
+const REQUIRED_ENV = ['DB_URL', 'STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET', 'CLIENT_URL'];
+const missingEnv = REQUIRED_ENV.filter((key) => !process.env[key]);
+if (missingEnv.length > 0) {
+    console.error(`Missing required environment variables: ${missingEnv.join(', ')}`);
+    process.exit(1);
+}
 
 const app = express();
 const port = process.env.PORT || 5000;
 
+app.disable('x-powered-by');
+if (process.env.NODE_ENV === 'production') {
+    app.set('trust proxy', 1);
+}
+
+app.use(helmet({
+    contentSecurityPolicy: false,
+    crossOriginResourcePolicy: { policy: 'cross-origin' },
+}));
+
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
+const allowedOrigins = [
+    process.env.CLIENT_URL,
+    ...(process.env.CLIENT_URLS || '')
+        .split(',')
+        .map((origin) => origin.trim())
+        .filter(Boolean),
+];
+if (process.env.NODE_ENV !== 'production') {
+    allowedOrigins.push('http://localhost:3000');
+}
+
 const corsOptions = {
-    origin: ['http://localhost:3000', 'https://studio-space-ivory.vercel.app'],
+    origin(origin, callback) {
+        if (!origin || allowedOrigins.includes(origin)) {
+            return callback(null, true);
+        }
+        return callback(new Error('Not allowed by CORS'));
+    },
     credentials: true,
 };
 app.use(cors(corsOptions));
 
-const client = new MongoClient(`${process.env.DB_URL}`);
+const apiLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 600,
+    standardHeaders: 'draft-7',
+    legacyHeaders: false,
+    message: { message: 'Too many requests, please try again later' },
+});
+
+const authLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    limit: 30,
+    standardHeaders: 'draft-7',
+    legacyHeaders: false,
+    message: { message: 'Too many attempts, please try again later' },
+});
+
+const writeLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    limit: 60,
+    standardHeaders: 'draft-7',
+    legacyHeaders: false,
+    message: { message: 'Too many requests, please slow down' },
+});
+
+app.use('/auth', authLimiter);
+app.use((req, res, next) => {
+    if (req.path.startsWith('/webhooks')) return next();
+    return apiLimiter(req, res, next);
+});
+app.use((req, res, next) => {
+    if (req.path.startsWith('/webhooks')) return next();
+    if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
+        return writeLimiter(req, res, next);
+    }
+    next();
+});
+
+const client = new MongoClient(process.env.DB_URL);
 
 export async function connectToMongoDB() {
     try {
@@ -25,7 +96,8 @@ export async function connectToMongoDB() {
         console.log("You successfully connected to MongoDB!");
         return client;
     } catch (err) {
-        console.dir(err);
+        console.error('Failed to connect to MongoDB:', err.message);
+        process.exit(1);
     }
 }
 
@@ -68,14 +140,21 @@ function getServiceInput(body = {}) {
         return { error: 'Title must be 3 to 100 characters' };
     }
     if (!SERVICE_CATEGORIES.includes(data.category)) return { error: 'Select a valid category' };
-    if (!Number.isFinite(data.basePrice) || data.basePrice <= 0) {
+    if (!Number.isFinite(data.basePrice) || data.basePrice <= 0 || data.basePrice > 1000000) {
         return { error: 'Price must be a number above 0' };
     }
-    if (!data.estimatedDuration) return { error: 'Estimated time is required' };
+    if (!data.estimatedDuration || data.estimatedDuration.length > 50) {
+        return { error: 'Estimated time is required' };
+    }
     if (!SERVICE_MODES.includes(data.serviceMode)) return { error: 'Select a valid service mode' };
-    if (!data.serviceArea) return { error: 'Service area is required' };
-    if (data.description.length < 20) {
-        return { error: 'Description must be at least 20 characters' };
+    if (!data.serviceArea || data.serviceArea.length > 100) {
+        return { error: 'Service area is required' };
+    }
+    if (data.description.length < 20 || data.description.length > 2000) {
+        return { error: 'Description must be 20 to 2000 characters' };
+    }
+    if (data.image.length > 2048) {
+        return { error: 'Image link is too long' };
     }
     if (data.image && !/^https?:\/\/\S+$/i.test(data.image)) {
         return { error: 'Image must be a valid link' };
@@ -183,18 +262,29 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
   res.send({ received: true });
 });
 
-app.use(express.json());
+app.use(express.json({ limit: '100kb' }));
 
 app.get('/', (req, res) => {
     res.send('fix-mate is running')
 })
 
+const JWKS = createRemoteJWKSet(
+    new URL(`${process.env.CLIENT_URL}/api/auth/jwks`)
+);
+
 // auth related api
 app.post('/auth/login', async (req, res) => {
-    const { token } = req.body;
-    if (!token) {
+    const { token } = req.body || {};
+    if (!token || typeof token !== 'string') {
         return res.status(400).send({ message: 'Token is required' });
     }
+
+    try {
+        await jwtVerify(token, JWKS);
+    } catch {
+        return res.status(401).send({ message: 'Invalid token' });
+    }
+
     res.cookie('token', token, {
         httpOnly: true,
         sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
@@ -205,21 +295,18 @@ app.post('/auth/login', async (req, res) => {
 })
 
 
-const JWKS = createRemoteJWKSet(
-    new URL(`${process.env.CLIENT_URL || 'http://localhost:3000'}/api/auth/jwks`)
-);
-
 const verifyToken = async (req, res, next) => {
     const authHeader = req.headers.authorization;
     if (!authHeader) {
         res.status(401).send({ message: 'Unauthorized' });
         return;
     }
-    const token = authHeader.split(' ')[1];
-    if (!token) {
+    const match = /^Bearer\s+(.+)$/i.exec(authHeader);
+    if (!match) {
         res.status(401).send({ message: 'Unauthorized' });
         return;
     }
+    const token = match[1];
 
     let payload;
     try {
@@ -280,15 +367,27 @@ const verifyAdmin = async (req, res, next) => {
   }
 };
 
+// Deleting a service is allowed for its owner (technician) or an admin.
+const verifyTechnicianOrAdmin = (req, res, next) => {
+  if (req.user?.role !== 'technician' && req.user?.role !== 'admin') {
+    return res.status(403).send({ message: 'Technicians or admins only' });
+  }
+  next();
+};
+
 // services related apis
 function escapeRegex(str) {
     return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 app.get('/services', async (req, res) => {
-    const { search, category, serviceMode, sort } = req.query;
-    const page = Math.max(1, parseInt(req.query.page) || 1);
-    const limit = Math.min(50, Math.max(1, parseInt(req.query.limit) || 8));
+    const asString = (value) => (typeof value === 'string' ? value.trim() : '');
+    const search = asString(req.query.search).slice(0, 100);
+    const category = asString(req.query.category);
+    const serviceMode = asString(req.query.serviceMode);
+    const sort = asString(req.query.sort);
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 8));
 
     const query = { approvalStatus: 'approved', isAvailable: { $ne: false } };
     if (category) {
@@ -460,13 +559,8 @@ app.patch('/services/:id/availability', verifyToken, verifyTechnician, async (re
   }
 });
 
-app.post('/services', verifyToken, async (req, res) => {
+app.post('/services', verifyToken, verifyTechnician, async (req, res) => {
     try {
-        // Role comes from the database, never from the client
-        if (req.user.role !== 'technician') {
-            return res.status(403).send({ message: 'Only technicians can add services' });
-        }
-
         const { data, error } = getServiceInput(req.body || {});
         if (error) return res.status(400).send({ message: error });
 
@@ -488,7 +582,7 @@ app.post('/services', verifyToken, async (req, res) => {
 })
 
 
-app.delete('/services/:id', verifyToken, async (req, res) => {
+app.delete('/services/:id', verifyToken, verifyTechnicianOrAdmin, async (req, res) => {
     try {
         if (!ObjectId.isValid(req.params.id)) {
             return res.status(404).send({ message: 'Service not found' });
@@ -515,12 +609,8 @@ app.delete('/services/:id', verifyToken, async (req, res) => {
 // booking related apis
 const ACTIVE_BOOKING_STATUSES = ['requested', 'accepted', 'in-progress'];
 
-app.post('/bookings', verifyToken, async (req, res) => {
+app.post('/bookings', verifyToken, verifyCustomer, async (req, res) => {
   try {
-    if (req.user.role !== 'customer') {
-      return res.status(403).send({ message: 'Only customers can send a repair request' });
-    }
-
     const body = req.body || {};
     const serviceId = String(body.serviceId || '').trim();
     const customerPhone = String(body.customerPhone || '').trim();
@@ -537,8 +627,14 @@ app.post('/bookings', verifyToken, async (req, res) => {
     if (!/^\d{4}-\d{2}-\d{2}$/.test(preferredDate) || Number.isNaN(Date.parse(preferredDate))) {
       return res.status(400).send({ message: 'Invalid preferred date' });
     }
-    if (problemDescription.length < 10) {
-      return res.status(400).send({ message: 'Please describe the problem in more detail' });
+    if (customerPhone.length > 20) {
+      return res.status(400).send({ message: 'Phone number is too long' });
+    }
+    if (address.length > 300) {
+      return res.status(400).send({ message: 'Address is too long' });
+    }
+    if (problemDescription.length < 10 || problemDescription.length > 2000) {
+      return res.status(400).send({ message: 'Please describe the problem in 10 to 2000 characters' });
     }
 
     // Trust the database, not the client: the service must exist, be approved and bookable
@@ -593,7 +689,7 @@ app.post('/bookings', verifyToken, async (req, res) => {
 })
 
 
-app.get('/bookings/my', verifyToken, async (req, res) => {
+app.get('/bookings/my', verifyToken, verifyCustomer, async (req, res) => {
   try {
     const data = await bookings
       .find({ customerEmail: req.user.email })
@@ -606,7 +702,7 @@ app.get('/bookings/my', verifyToken, async (req, res) => {
   }
 });
 
-app.patch('/bookings/:id/cancel', verifyToken, async (req, res) => {
+app.patch('/bookings/:id/cancel', verifyToken, verifyCustomer, async (req, res) => {
   try {
     if (!ObjectId.isValid(req.params.id)) {
       return res.status(404).send({ message: 'Booking not found' });
@@ -628,7 +724,7 @@ app.patch('/bookings/:id/cancel', verifyToken, async (req, res) => {
 
 
 // Overview stats
-app.get('/bookings/my/stats', verifyToken, async (req, res) => {
+app.get('/bookings/my/stats', verifyToken, verifyCustomer, async (req, res) => {
   try {
     const customerEmail = req.user.email;
     const [totalRequests, activeJobs, completedJobs] = await Promise.all([
@@ -668,11 +764,11 @@ app.post('/payments/checkout', verifyToken, verifyCustomer, async (req, res) => 
       return res.status(400).send({ message: 'This booking has no payable amount' });
     }
 
-    // Send the customer back to the page that started the checkout
-    const returnPath =
-      req.body?.returnTo === 'payments'
-        ? '/dashboard/customer/payments'
-        : '/dashboard/customer/bookings';
+    // Stripe reuses the same session for an identical idempotency key, so a
+    // double-click or retry cannot charge the same booking twice.
+    const idempotencyKey = `checkout_${booking._id}_${
+      booking.updatedAt instanceof Date ? booking.updatedAt.getTime() : 'na'
+    }`;
 
     const session = await stripe.checkout.sessions.create({
       mode: 'payment',
@@ -688,9 +784,9 @@ app.post('/payments/checkout', verifyToken, verifyCustomer, async (req, res) => 
         },
       ],
       metadata: { bookingId: String(booking._id) },
-      success_url: `${process.env.CLIENT_URL}${returnPath}?payment=success&session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${process.env.CLIENT_URL}${returnPath}?payment=cancelled`,
-    });
+      success_url: `${process.env.CLIENT_URL}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.CLIENT_URL}/payment/cancel?booking=${booking._id}`,
+    }, { idempotencyKey });
 
     res.send({ url: session.url });
   } catch (error) {
@@ -711,14 +807,20 @@ app.get('/payments/verify', verifyToken, verifyCustomer, async (req, res) => {
     const session = await stripe.checkout.sessions.retrieve(sessionId);
     const bookingId = session.metadata?.bookingId;
 
-    if (bookingId && ObjectId.isValid(bookingId) && session.payment_status === 'paid') {
-      const booking = await bookings.findOne({
-        _id: new ObjectId(bookingId),
-        customerEmail: req.user.email,
-      });
-      if (booking) {
-        await markBookingPaid(bookingId, session);
-      }
+    if (!bookingId || !ObjectId.isValid(bookingId)) {
+      return res.status(400).send({ message: 'Invalid payment session' });
+    }
+
+    const booking = await bookings.findOne({
+      _id: new ObjectId(bookingId),
+      customerEmail: req.user.email,
+    });
+    if (!booking) {
+      return res.status(404).send({ message: 'Payment not found' });
+    }
+
+    if (session.payment_status === 'paid') {
+      await markBookingPaid(bookingId, session);
     }
 
     res.send({
@@ -729,6 +831,13 @@ app.get('/payments/verify', verifyToken, verifyCustomer, async (req, res) => {
         typeof session.payment_intent === 'string'
           ? session.payment_intent
           : session.payment_intent?.id,
+      serviceTitle: booking?.serviceTitle || null,
+      technicianName: booking?.technicianName || null,
+      amount:
+        session.amount_total != null
+          ? session.amount_total / 100
+          : Number(booking?.finalAmount) || null,
+      currency: (session.currency || 'usd').toUpperCase(),
     });
   } catch (error) {
     console.error(error);
@@ -751,12 +860,22 @@ const STATUS_FLOW = {
 app.get('/bookings/technician/stats', verifyToken, verifyTechnician, async (req, res) => {
   try {
     const technicianEmail = req.user.email;
-    const [totalRequests, activeJobs, completedJobs] = await Promise.all([
+    const [totalRequests, activeJobs, completedJobs, totalServices, approvedServices, pendingRequests] = await Promise.all([
       bookings.countDocuments({ technicianEmail }),
       bookings.countDocuments({ technicianEmail, status: { $in: ['accepted', 'in-progress'] } }),
       bookings.countDocuments({ technicianEmail, status: 'completed' }),
+      services.countDocuments({ technicianEmail }),
+      services.countDocuments({ technicianEmail, approvalStatus: 'approved' }),
+      bookings.countDocuments({ technicianEmail, status: 'requested' }),
     ]);
-    res.send({ totalRequests, activeJobs, completedJobs });
+    res.send({
+      totalRequests,
+      activeJobs,
+      completedJobs,
+      totalServices,
+      approvedServices,
+      pendingRequests,
+    });
   } catch (error) {
     console.error(error);
     res.status(500).send({ message: 'Failed to fetch stats' });
@@ -1107,6 +1226,15 @@ app.get('/payments/my', verifyToken,verifyCustomer , async (req, res) => {
   }
 });
 
+
+app.use((err, req, res, next) => {
+    if (res.headersSent) return next(err);
+    if (err.message === 'Not allowed by CORS') {
+        return res.status(403).send({ message: 'Origin not allowed' });
+    }
+    console.error(err);
+    res.status(500).send({ message: 'Something went wrong' });
+});
 
 app.listen(port, () => {
     console.log(`fix-mate is fixing on port ${port}`)

@@ -93,7 +93,7 @@ const client = new MongoClient(process.env.DB_URL);
 export async function connectToMongoDB() {
     try {
         await client.connect();
-        console.log("You successfully connected to MongoDB!");
+        console.log("You successfully connected to DB!");
         return client;
     } catch (err) {
         console.error('Failed to connect to MongoDB:', err.message);
@@ -721,16 +721,63 @@ app.patch('/bookings/:id/cancel', verifyToken, verifyCustomer, async (req, res) 
 
 
 
+const MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+// The last 6 months, oldest first, in UTC so it matches Mongo's $year/$month.
+function lastSixMonths() {
+  const now = new Date();
+  const months = [];
+  for (let i = 5; i >= 0; i -= 1) {
+    const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - i, 1));
+    months.push({ year: d.getUTCFullYear(), monthIndex: d.getUTCMonth(), month: MONTH_NAMES[d.getUTCMonth()] });
+  }
+  return months;
+}
+
+// Sums `amount` per month for the last 6 months. Every month is returned (zeros included).
+async function sumAmountByMonth(collection, match = {}) {
+  const months = lastSixMonths();
+  const start = new Date(Date.UTC(months[0].year, months[0].monthIndex, 1));
+
+  const rows = await collection
+    .aggregate([
+      { $match: { ...match, paidAt: { $gte: start } } },
+      {
+        $group: {
+          _id: { year: { $year: '$paidAt' }, month: { $month: '$paidAt' } },
+          total: { $sum: '$amount' },
+        },
+      },
+    ])
+    .toArray();
+
+  const totals = new Map(rows.map((row) => [`${row._id.year}-${row._id.month}`, row.total]));
+  return months.map((m) => ({
+    month: m.month,
+    value: Math.round((totals.get(`${m.year}-${m.monthIndex + 1}`) || 0) * 100) / 100,
+  }));
+}
+
+// Counts documents grouped by a field -> [{ [field]: value, count: n }]
+async function countByField(collection, field, match = {}) {
+  const rows = await collection
+    .aggregate([{ $match: match }, { $group: { _id: `$${field}`, count: { $sum: 1 } } }])
+    .toArray();
+  return rows.map((row) => ({ [field]: row._id, count: row.count }));
+}
+
 // Overview stats
 app.get('/bookings/my/stats', verifyToken, verifyCustomer, async (req, res) => {
   try {
     const customerEmail = req.user.email;
-    const [totalRequests, activeJobs, completedJobs] = await Promise.all([
+    const [totalRequests, activeJobs, completedJobs, spendingByMonth, bookingsByStatus] = await Promise.all([
       bookings.countDocuments({ customerEmail }),
       bookings.countDocuments({ customerEmail, status: { $in: ['accepted', 'in-progress'] } }),
       bookings.countDocuments({ customerEmail, status: 'completed' }),
+      sumAmountByMonth(payments, { customerEmail }),
+      countByField(bookings, 'status', { customerEmail }),
     ]);
-    res.send({ totalRequests, activeJobs, completedJobs });
+    res.send({ totalRequests, activeJobs, completedJobs, spendingByMonth, bookingsByStatus });
   } catch (error) {
     console.error(error);
     res.status(500).send({ message: 'Failed to fetch stats' });
@@ -853,13 +900,26 @@ const STATUS_FLOW = {
 app.get('/bookings/technician/stats', verifyToken, verifyTechnician, async (req, res) => {
   try {
     const technicianEmail = req.user.email;
-    const [totalRequests, activeJobs, completedJobs, totalServices, approvedServices, pendingRequests] = await Promise.all([
+    const [
+      totalRequests,
+      activeJobs,
+      completedJobs,
+      totalServices,
+      approvedServices,
+      pendingRequests,
+      earningsByMonth,
+      bookingsByStatus,
+      servicesByApproval,
+    ] = await Promise.all([
       bookings.countDocuments({ technicianEmail }),
       bookings.countDocuments({ technicianEmail, status: { $in: ['accepted', 'in-progress'] } }),
       bookings.countDocuments({ technicianEmail, status: 'completed' }),
       services.countDocuments({ technicianEmail }),
       services.countDocuments({ technicianEmail, approvalStatus: 'approved' }),
       bookings.countDocuments({ technicianEmail, status: 'requested' }),
+      sumAmountByMonth(payments, { technicianEmail }),
+      countByField(bookings, 'status', { technicianEmail }),
+      countByField(services, 'approvalStatus', { technicianEmail }),
     ]);
     res.send({
       totalRequests,
@@ -868,6 +928,9 @@ app.get('/bookings/technician/stats', verifyToken, verifyTechnician, async (req,
       totalServices,
       approvedServices,
       pendingRequests,
+      earningsByMonth,
+      bookingsByStatus,
+      servicesByApproval,
     });
   } catch (error) {
     console.error(error);
@@ -934,14 +997,36 @@ app.patch('/bookings/:id/status', verifyToken, verifyTechnician, async (req, res
 // admin related apis
 app.get('/admin/stats', verifyToken, verifyAdmin, async (req, res) => {
   try {
-    const [totalUsers, totalTechnicians, pendingServices, revenueSummary] = await Promise.all([
+    const [
+      totalUsers,
+      totalTechnicians,
+      pendingServices,
+      revenueSummary,
+      revenueByMonth,
+      bookingsByStatus,
+      usersByRole,
+      servicesByApproval,
+    ] = await Promise.all([
       users.countDocuments(),
       users.countDocuments({ role: 'technician' }),
       services.countDocuments({ approvalStatus: 'pending' }),
       payments.aggregate([{ $group: { _id: null, revenue: { $sum: '$amount' } } }]).toArray(),
+      sumAmountByMonth(payments),
+      countByField(bookings, 'status'),
+      countByField(users, 'role'),
+      countByField(services, 'approvalStatus'),
     ]);
     const totalRevenue = Math.round((revenueSummary[0]?.revenue || 0) * 100) / 100;
-    res.send({ totalUsers, totalTechnicians, pendingServices, totalRevenue });
+    res.send({
+      totalUsers,
+      totalTechnicians,
+      pendingServices,
+      totalRevenue,
+      revenueByMonth,
+      bookingsByStatus,
+      usersByRole,
+      servicesByApproval,
+    });
   } catch (error) {
     console.error(error);
     res.status(500).send({ message: 'Failed to fetch stats' });
